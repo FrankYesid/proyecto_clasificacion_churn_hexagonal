@@ -2,6 +2,12 @@
 DAG de Airflow para el pipeline automatizado de entrenamiento del modelo de churn.
 Este DAG ejecuta el pipeline completo de ML: extracción de datos, preprocesamiento,
 entrenamiento, evaluación y despliegue del modelo.
+
+Características adicionales:
+- Monitoreo de deriva de datos (data drift)
+- Monitoreo de rendimiento del modelo
+- Alertas avanzadas basadas en métricas de negocio
+- Integración con sistemas de monitoreo externos
 """
 
 from datetime import datetime, timedelta
@@ -11,10 +17,17 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.email import EmailOperator
 from airflow.models import Variable
 from airflow.utils.task_group import TaskGroup
+from airflow.sensors.filesystem import FileSensor
+from airflow.operators.dummy import DummyOperator
+from airflow.utils.trigger_rule import TriggerRule
 import logging
 import os
 import sys
+import json
+import pandas as pd
+import numpy as np
 from pathlib import Path
+from typing import Dict, Any, Optional
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
