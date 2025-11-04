@@ -334,7 +334,238 @@ def deploy_model(**context):
     return deployment_info
 
 
-def generate_report(**context):
+def detect_data_drift(**context):
+    """
+    Detecta deriva de datos comparando distribuciones actuales con referencia histórica.
+    """
+    logger.info("Detecting data drift...")
+    
+    config = get_config()
+    data_path = config['data_path']
+    
+    # Cargar datos actuales
+    df_current = pd.read_csv(data_path)
+    
+    # Intentar cargar datos de referencia histórica
+    reference_path = "/opt/airflow/data/reference/reference_data.csv"
+    drift_detected = False
+    drift_metrics = {}
+    
+    if os.path.exists(reference_path):
+        df_reference = pd.read_csv(reference_path)
+        
+        # Columnas numéricas para análisis
+        numeric_columns = ['monthly_charges', 'total_charges', 'tenure_months']
+        
+        for col in numeric_columns:
+            if col in df_current.columns and col in df_reference.columns:
+                # Calcular estadísticas
+                current_mean = df_current[col].mean()
+                reference_mean = df_reference[col].mean()
+                current_std = df_current[col].std()
+                reference_std = df_reference[col].std()
+                
+                # Detectar drift usando cambio significativo en media (>2 desviaciones estándar)
+                std_diff = abs(current_mean - reference_mean) / reference_std if reference_std > 0 else 0
+                
+                drift_metrics[col] = {
+                    'current_mean': current_mean,
+                    'reference_mean': reference_mean,
+                    'std_differences': std_diff,
+                    'drift_detected': std_diff > 2.0  # Umbral configurable
+                }
+                
+                if std_diff > 2.0:
+                    drift_detected = True
+                    logger.warning(f"Data drift detected in {col}: {std_diff:.2f} std deviations")
+        
+        # Análisis de distribución de clases
+        current_churn_dist = df_current['churn'].value_counts(normalize=True)
+        reference_churn_dist = df_reference['churn'].value_counts(normalize=True)
+        
+        if True in current_churn_dist.index and True in reference_churn_dist.index:
+            churn_diff = abs(current_churn_dist[True] - reference_churn_dist[True])
+            drift_metrics['churn_distribution'] = {
+                'current_churn_rate': current_churn_dist[True],
+                'reference_churn_rate': reference_churn_dist[True],
+                'difference': churn_diff,
+                'drift_detected': churn_diff > 0.05  # 5% threshold
+            }
+            
+            if churn_diff > 0.05:
+                drift_detected = True
+                logger.warning(f"Churn distribution drift detected: {churn_diff:.2%}")
+    
+    # Guardar resultados
+    context['task_instance'].xcom_push(key='drift_detection', value={
+        'drift_detected': drift_detected,
+        'metrics': drift_metrics,
+        'timestamp': datetime.now().isoformat()
+    })
+    
+    # Si se detecta drift significativo, podríamos querer alertar o incluso detener el pipeline
+    drift_action = Variable.get('drift_action_on_detection', default_var='warn')  # warn, stop, ignore
+    
+    if drift_detected and drift_action == 'stop':
+        raise ValueError("Significant data drift detected - stopping pipeline execution")
+    elif drift_detected and drift_action == 'warn':
+        logger.warning("Data drift detected - continuing with caution")
+    
+    logger.info("Data drift detection completed")
+    return "Drift detection completed"
+
+
+def monitor_model_performance(**context):
+    """
+    Monitorea el rendimiento del modelo en producción y detecta degradación.
+    """
+    logger.info("Monitoring model performance...")
+    
+    # Intentar cargar métricas de rendimiento recientes
+    performance_log_path = "/opt/airflow/models/performance_log.json"
+    performance_degradation = False
+    performance_metrics = {}
+    
+    if os.path.exists(performance_log_path):
+        try:
+            with open(performance_log_path, 'r') as f:
+                performance_log = json.load(f)
+            
+            # Analizar tendencias de métricas clave
+            if len(performance_log) >= 5:  # Necesitamos al menos 5 puntos de datos
+                recent_metrics = performance_log[-5:]  # Últimas 5 mediciones
+                
+                # Calcular promedios móviles
+                recent_accuracy = np.mean([m.get('accuracy', 0) for m in recent_metrics])
+                baseline_accuracy = np.mean([m.get('accuracy', 0) for m in performance_log[:-5]])
+                
+                recent_precision = np.mean([m.get('precision', 0) for m in recent_metrics])
+                baseline_precision = np.mean([m.get('precision', 0) for m in performance_log[:-5]])
+                
+                # Detectar degradación (caída > 5%)
+                accuracy_degradation = (baseline_accuracy - recent_accuracy) / baseline_accuracy if baseline_accuracy > 0 else 0
+                precision_degradation = (baseline_precision - recent_precision) / baseline_precision if baseline_precision > 0 else 0
+                
+                performance_metrics = {
+                    'baseline_accuracy': baseline_accuracy,
+                    'recent_accuracy': recent_accuracy,
+                    'accuracy_degradation': accuracy_degradation,
+                    'baseline_precision': baseline_precision,
+                    'recent_precision': recent_precision,
+                    'precision_degradation': precision_degradation
+                }
+                
+                if accuracy_degradation > 0.05 or precision_degradation > 0.05:
+                    performance_degradation = True
+                    logger.warning(f"Model performance degradation detected: accuracy {-accuracy_degradation:.1%}, precision {-precision_degradation:.1%}")
+                
+        except Exception as e:
+            logger.error(f"Error monitoring model performance: {str(e)}")
+            # No fallar el pipeline por problemas de monitoreo
+    
+    # Guardar resultados
+    context['task_instance'].xcom_push(key='performance_monitoring', value={
+        'degradation_detected': performance_degradation,
+        'metrics': performance_metrics,
+        'timestamp': datetime.now().isoformat()
+    })
+    
+    logger.info("Model performance monitoring completed")
+    return "Performance monitoring completed"
+
+
+def send_advanced_alerts(**context):
+    """
+    Envía alertas avanzadas basadas en métricas de negocio y condiciones especiales.
+    """
+    logger.info("Sending advanced alerts...")
+    
+    # Recopilar información de todas las tareas
+    drift_detection = context['task_instance'].xcom_pull(key='drift_detection')
+    performance_monitoring = context['task_instance'].xcom_push(key='performance_monitoring')
+    training_results = context['task_instance'].xcom_pull(key='training_results')
+    validation_results = context['task_instance'].xcom_pull(key='validation_results')
+    
+    alerts = []
+    
+    # Alertas de deriva de datos
+    if drift_detection and drift_detection.get('drift_detected', False):
+        alerts.append({
+            'type': 'DATA_DRIFT',
+            'severity': 'WARNING',
+            'message': 'Significant data drift detected in training data',
+            'details': drift_detection.get('metrics', {})
+        })
+    
+    # Alertas de degradación de modelo
+    if performance_monitoring and performance_monitoring.get('degradation_detected', False):
+        alerts.append({
+            'type': 'MODEL_DEGRADATION',
+            'severity': 'CRITICAL',
+            'message': 'Model performance degradation detected',
+            'details': performance_monitoring.get('metrics', {})
+        })
+    
+    # Alertas de bajo rendimiento de entrenamiento
+    if training_results and validation_results:
+        accuracy = training_results.get('accuracy', 0)
+        min_accuracy = 0.8  # Umbral más alto para alerta
+        
+        if accuracy < min_accuracy:
+            alerts.append({
+                'type': 'LOW_ACCURACY',
+                'severity': 'WARNING',
+                'message': f'Model accuracy ({accuracy:.3f}) below alert threshold ({min_accuracy})',
+                'details': {'accuracy': accuracy, 'threshold': min_accuracy}
+            })
+    
+    # Enviar alertas si hay alguna
+    if alerts:
+        alert_message = "\n\n".join([
+            f"ALERT: {alert['type']} - {alert['severity']}\n{alert['message']}\nDetails: {json.dumps(alert['details'], indent=2)}"
+            for alert in alerts
+        ])
+        
+        # Enviar email de alerta adicional
+        try:
+            from airflow.operators.email import send_email
+            
+            subject = f"🚨 Churn Model Pipeline Alerts - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            body = f"""
+The following alerts were generated during the churn model training pipeline:
+
+{alert_message}
+
+Please review the pipeline execution and take appropriate action.
+
+Pipeline Execution Date: {context['ds']}
+DAG Run ID: {context['run_id']}
+            """
+            
+            send_email(
+                to=get_config()['email_to'],
+                subject=subject,
+                html_content=body.replace('\n', '<br>')
+            )
+            
+            logger.info(f"Sent {len(alerts)} advanced alerts")
+            
+        except Exception as e:
+            logger.error(f"Error sending advanced alerts: {str(e)}")
+    
+    # Guardar historial de alertas
+    alerts_history_path = f"/tmp/alerts_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(alerts_history_path, 'w') as f:
+        json.dump({
+            'timestamp': datetime.now().isoformat(),
+            'alerts': alerts,
+            'dag_run_id': context['run_id']
+        }, f, indent=2)
+    
+    context['task_instance'].xcom_push(key='alerts_sent', value=len(alerts))
+    
+    logger.info("Advanced alerts processing completed")
+    return f"Sent {len(alerts)} alerts"
     """
     Genera un reporte del entrenamiento.
     """
@@ -402,24 +633,61 @@ default_args = {
     'retry_delay': timedelta(minutes=5),
 }
 
-# Definir el DAG
+# Definir el DAG con configuración mejorada
 dag = DAG(
     'churn_model_training_pipeline',
     default_args=default_args,
-    description='Automated ML pipeline for customer churn prediction model training',
+    description='Automated ML pipeline for customer churn prediction model training with advanced monitoring',
     schedule_interval='@weekly',  # Ejecutar semanalmente
     catchup=False,
-    tags=['ml', 'churn', 'training'],
+    tags=['ml', 'churn', 'training', 'monitoring', 'production'],
+    max_active_runs=1,  # Solo una ejecución a la vez
+    concurrency=2,  # Máximo 2 tareas en paralelo
 )
 
 # Definir tareas
 with dag:
-    # Tarea de verificación de datos
-    check_data_task = PythonOperator(
-        task_id='check_data_quality',
-        python_callable=check_data_quality,
+    # Sensor para esperar disponibilidad de datos
+    wait_for_data = FileSensor(
+        task_id='wait_for_data',
+        filepath=get_config()['data_path'],
+        fs_conn_id='fs_default',
+        poke_interval=60,  # Revisar cada minuto
+        timeout=60*60*24,  # Timeout después de 24 horas
+        mode='poke',
+    )
+    
+    # Tarea de inicio
+    start_pipeline = DummyOperator(
+        task_id='start_pipeline',
         dag=dag,
     )
+    
+    # Grupo de tareas de monitoreo
+    with TaskGroup("monitoring_and_preparation", dag=dag) as monitoring_group:
+        # Detección de deriva de datos
+        detect_drift_task = PythonOperator(
+            task_id='detect_data_drift',
+            python_callable=detect_data_drift,
+            dag=dag,
+        )
+        
+        # Monitoreo de rendimiento del modelo
+        monitor_performance_task = PythonOperator(
+            task_id='monitor_model_performance',
+            python_callable=monitor_model_performance,
+            dag=dag,
+        )
+        
+        # Verificación de calidad de datos (original)
+        check_data_task = PythonOperator(
+            task_id='check_data_quality',
+            python_callable=check_data_quality,
+            dag=dag,
+        )
+        
+        # Dependencias dentro del grupo
+        [detect_drift_task, monitor_performance_task] >> check_data_task
     
     # Tarea de extracción y preprocesamiento
     preprocess_task = PythonOperator(
@@ -446,7 +714,7 @@ with dag:
     deploy_task = PythonOperator(
         task_id='deploy_model',
         python_callable=deploy_model,
-        trigger_rule='all_success',  # Solo ejecutar si todas las tareas anteriores fueron exitosas
+        trigger_rule=TriggerRule.ALL_SUCCESS,  # Solo ejecutar si todas las tareas anteriores fueron exitosas
         dag=dag,
     )
     
@@ -454,6 +722,14 @@ with dag:
     report_task = PythonOperator(
         task_id='generate_report',
         python_callable=generate_report,
+        dag=dag,
+    )
+    
+    # Tarea de alertas avanzadas
+    advanced_alerts_task = PythonOperator(
+        task_id='send_advanced_alerts',
+        python_callable=send_advanced_alerts,
+        trigger_rule=TriggerRule.ALL_DONE,  # Ejecutar siempre, independientemente del resultado
         dag=dag,
     )
     
@@ -465,21 +741,30 @@ with dag:
         html_content="""
         <h3>Churn Model Training Pipeline Completed</h3>
         <p>Date: {{ ds }}</p>
-        <p>Status: {{ task_instance.xcom_pull(key='validation_results', task_ids='validate_model')['passed'] }}</p>
+        <p>Status: {{ 'SUCCESS' if task_instance.xcom_pull(key='validation_results', task_ids='validate_model')['passed'] else 'FAILED' }}</p>
         <p>Model Accuracy: {{ task_instance.xcom_pull(key='training_results', task_ids='train_model')['accuracy'] }}</p>
+        <p>Data Drift Detected: {{ 'YES' if task_instance.xcom_pull(key='drift_detection', task_ids='detect_data_drift')['drift_detected'] else 'NO' }}</p>
+        <p>Performance Degradation: {{ 'YES' if task_instance.xcom_pull(key='performance_monitoring', task_ids='monitor_model_performance')['degradation_detected'] else 'NO' }}</p>
         <p>Report: {{ task_instance.xcom_pull(key='report_path', task_ids='generate_report') }}</p>
+        <p>Alerts Sent: {{ task_instance.xcom_pull(key='alerts_sent', task_ids='send_advanced_alerts') or 0 }}</p>
         """,
         dag=dag,
     )
     
-    # Limpiar archivos temporales
+    # Tarea de limpieza
     cleanup_task = BashOperator(
         task_id='cleanup_temp_files',
-        bash_command='rm -f /tmp/preprocessed_data.csv /tmp/training_report_*.txt',
+        bash_command='rm -f /tmp/preprocessed_data.csv /tmp/training_report_*.txt /tmp/alerts_history_*.json',
         dag=dag,
     )
     
-    # Definir flujo de dependencias
-    check_data_task >> preprocess_task >> train_task >> validate_task
-    validate_task >> [deploy_task, report_task]
-    [deploy_task, report_task] >> email_task >> cleanup_task
+    # Tarea final
+    end_pipeline = DummyOperator(
+        task_id='end_pipeline',
+        trigger_rule=TriggerRule.ALL_DONE,  # Ejecutar siempre
+        dag=dag,
+    )
+    
+    # Definir flujo de dependencias mejorado
+    wait_for_data >> start_pipeline >> monitoring_group >> preprocess_task >> train_task >> validate_task
+    validate_task >> [deploy_task, report_task] >> advanced_alerts_task >> email_task >> cleanup_task >> end_pipeline
