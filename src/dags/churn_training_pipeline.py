@@ -28,6 +28,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from typing import Dict, Any, Optional
+from scipy import stats
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -350,12 +351,18 @@ def detect_data_drift(**context):
     reference_path = "/opt/airflow/data/reference/reference_data.csv"
     drift_detected = False
     drift_metrics = {}
+    drift_severity = 'NONE'
     
     if os.path.exists(reference_path):
         df_reference = pd.read_csv(reference_path)
         
         # Columnas numéricas para análisis
         numeric_columns = ['monthly_charges', 'total_charges', 'tenure_months']
+        
+        # Umbrales configurables para drift
+        drift_threshold_medium = float(Variable.get('drift_threshold_medium', default_var='2.0'))
+        drift_threshold_high = float(Variable.get('drift_threshold_high', default_var='3.0'))
+        drift_threshold_critical = float(Variable.get('drift_threshold_critical', default_var='5.0'))
         
         for col in numeric_columns:
             if col in df_current.columns and col in df_reference.columns:
@@ -365,40 +372,111 @@ def detect_data_drift(**context):
                 current_std = df_current[col].std()
                 reference_std = df_reference[col].std()
                 
-                # Detectar drift usando cambio significativo en media (>2 desviaciones estándar)
+                # Detectar drift usando cambio significativo en media (desviaciones estándar)
                 std_diff = abs(current_mean - reference_mean) / reference_std if reference_std > 0 else 0
                 
+                # Calcular Kolmogorov-Smirnov test para distribución completa
+                try:
+                    ks_statistic, ks_pvalue = stats.ks_2samp(df_current[col].dropna(), df_reference[col].dropna())
+                except:
+                    ks_statistic, ks_pvalue = 0, 1
+                
+                # Determinar severidad
+                col_severity = 'NONE'
+                if std_diff >= drift_threshold_critical:
+                    col_severity = 'CRITICAL'
+                    drift_detected = True
+                elif std_diff >= drift_threshold_high:
+                    col_severity = 'HIGH'
+                    drift_detected = True
+                elif std_diff >= drift_threshold_medium:
+                    col_severity = 'MEDIUM'
+                    drift_detected = True
+                elif ks_pvalue < 0.01:  # Distribución significativamente diferente
+                    col_severity = 'MEDIUM'
+                    drift_detected = True
+                
                 drift_metrics[col] = {
-                    'current_mean': current_mean,
-                    'reference_mean': reference_mean,
-                    'std_differences': std_diff,
-                    'drift_detected': std_diff > 2.0  # Umbral configurable
+                    'current_mean': float(current_mean),
+                    'reference_mean': float(reference_mean),
+                    'current_std': float(current_std),
+                    'reference_std': float(reference_std),
+                    'mean_difference': float(abs(current_mean - reference_mean)),
+                    'std_differences': float(std_diff),
+                    'ks_statistic': float(ks_statistic),
+                    'ks_pvalue': float(ks_pvalue),
+                    'drift_detected': std_diff >= drift_threshold_medium or ks_pvalue < 0.01,
+                    'severity': col_severity
                 }
                 
-                if std_diff > 2.0:
-                    drift_detected = True
-                    logger.warning(f"Data drift detected in {col}: {std_diff:.2f} std deviations")
+                # Actualizar severidad global
+                if col_severity == 'CRITICAL':
+                    drift_severity = 'CRITICAL'
+                elif col_severity == 'HIGH' and drift_severity not in ['CRITICAL']:
+                    drift_severity = 'HIGH'
+                elif col_severity == 'MEDIUM' and drift_severity not in ['CRITICAL', 'HIGH']:
+                    drift_severity = 'MEDIUM'
+                
+                if drift_metrics[col]['drift_detected']:
+                    logger.warning(f"Data drift detected in {col}: {std_diff:.2f} std deviations, KS p-value: {ks_pvalue:.4f}, Severity: {col_severity}")
         
         # Análisis de distribución de clases
         current_churn_dist = df_current['churn'].value_counts(normalize=True)
         reference_churn_dist = df_reference['churn'].value_counts(normalize=True)
         
+        churn_dist_threshold = float(Variable.get('churn_dist_drift_threshold', default_var='0.05'))
+        
         if True in current_churn_dist.index and True in reference_churn_dist.index:
             churn_diff = abs(current_churn_dist[True] - reference_churn_dist[True])
+            churn_drift_detected = churn_diff > churn_dist_threshold
+            
             drift_metrics['churn_distribution'] = {
-                'current_churn_rate': current_churn_dist[True],
-                'reference_churn_rate': reference_churn_dist[True],
-                'difference': churn_diff,
-                'drift_detected': churn_diff > 0.05  # 5% threshold
+                'current_churn_rate': float(current_churn_dist[True]),
+                'reference_churn_rate': float(reference_churn_dist[True]),
+                'difference': float(churn_diff),
+                'drift_detected': churn_drift_detected,
+                'severity': 'HIGH' if churn_diff > 0.10 else 'MEDIUM' if churn_drift_detected else 'NONE'
             }
             
-            if churn_diff > 0.05:
+            if churn_drift_detected:
                 drift_detected = True
-                logger.warning(f"Churn distribution drift detected: {churn_diff:.2%}")
+                if drift_metrics['churn_distribution']['severity'] == 'HIGH':
+                    drift_severity = 'HIGH' if drift_severity not in ['CRITICAL'] else drift_severity
+                else:
+                    drift_severity = 'MEDIUM' if drift_severity not in ['CRITICAL', 'HIGH'] else drift_severity
+                logger.warning(f"Churn distribution drift detected: {churn_diff:.2%}, Severity: {drift_metrics['churn_distribution']['severity']}")
+        
+        # Análisis de características categóricas
+        categorical_columns = ['gender', 'partner', 'dependents', 'contract_type', 'payment_method']
+        for col in categorical_columns:
+            if col in df_current.columns and col in df_reference.columns:
+                current_dist = df_current[col].value_counts(normalize=True)
+                reference_dist = df_reference[col].value_counts(normalize=True)
+                
+                # Calcular diferencia total en distribución
+                all_categories = set(current_dist.index) | set(reference_dist.index)
+                total_diff = sum(abs(current_dist.get(cat, 0) - reference_dist.get(cat, 0)) for cat in all_categories) / 2
+                
+                if total_diff > 0.10:  # 10% diferencia total
+                    drift_metrics[f'{col}_distribution'] = {
+                        'total_variation_distance': float(total_diff),
+                        'drift_detected': True,
+                        'severity': 'MEDIUM' if total_diff > 0.20 else 'LOW'
+                    }
+                    drift_detected = True
+                    logger.warning(f"Categorical drift detected in {col}: {total_diff:.2%}")
+    
+    else:
+        # Si no hay referencia, usar primera ejecución como referencia
+        logger.info("No reference data found. Creating reference from current data...")
+        os.makedirs(os.path.dirname(reference_path), exist_ok=True)
+        df_current.to_csv(reference_path, index=False)
+        logger.info(f"Reference data saved to {reference_path}")
     
     # Guardar resultados
     context['task_instance'].xcom_push(key='drift_detection', value={
         'drift_detected': drift_detected,
+        'severity': drift_severity,
         'metrics': drift_metrics,
         'timestamp': datetime.now().isoformat()
     })
@@ -406,13 +484,16 @@ def detect_data_drift(**context):
     # Si se detecta drift significativo, podríamos querer alertar o incluso detener el pipeline
     drift_action = Variable.get('drift_action_on_detection', default_var='warn')  # warn, stop, ignore
     
-    if drift_detected and drift_action == 'stop':
-        raise ValueError("Significant data drift detected - stopping pipeline execution")
-    elif drift_detected and drift_action == 'warn':
-        logger.warning("Data drift detected - continuing with caution")
+    if drift_detected:
+        if drift_action == 'stop' and drift_severity in ['HIGH', 'CRITICAL']:
+            raise ValueError(f"Significant data drift detected (Severity: {drift_severity}) - stopping pipeline execution")
+        elif drift_action == 'warn':
+            logger.warning(f"Data drift detected (Severity: {drift_severity}) - continuing with caution")
+        elif drift_action == 'stop':
+            logger.warning(f"Data drift detected but action is set to 'stop' only for HIGH/CRITICAL - continuing")
     
-    logger.info("Data drift detection completed")
-    return "Drift detection completed"
+    logger.info(f"Data drift detection completed. Drift detected: {drift_detected}, Severity: {drift_severity}")
+    return f"Drift detection completed - Severity: {drift_severity}"
 
 
 def monitor_model_performance(**context):
@@ -425,6 +506,13 @@ def monitor_model_performance(**context):
     performance_log_path = "/opt/airflow/models/performance_log.json"
     performance_degradation = False
     performance_metrics = {}
+    degradation_severity = 'NONE'
+    
+    # Umbrales configurables
+    degradation_threshold_low = float(Variable.get('performance_degradation_threshold_low', default_var='0.05'))
+    degradation_threshold_medium = float(Variable.get('performance_degradation_threshold_medium', default_var='0.10'))
+    degradation_threshold_high = float(Variable.get('performance_degradation_threshold_high', default_var='0.20'))
+    min_data_points = int(Variable.get('performance_min_data_points', default_var='5'))
     
     if os.path.exists(performance_log_path):
         try:
@@ -432,46 +520,141 @@ def monitor_model_performance(**context):
                 performance_log = json.load(f)
             
             # Analizar tendencias de métricas clave
-            if len(performance_log) >= 5:  # Necesitamos al menos 5 puntos de datos
-                recent_metrics = performance_log[-5:]  # Últimas 5 mediciones
+            if len(performance_log) >= min_data_points:
+                window_size = min(5, len(performance_log) // 2)
+                recent_metrics = performance_log[-window_size:]  # Ventana reciente
                 
-                # Calcular promedios móviles
-                recent_accuracy = np.mean([m.get('accuracy', 0) for m in recent_metrics])
-                baseline_accuracy = np.mean([m.get('accuracy', 0) for m in performance_log[:-5]])
+                # Calcular promedios móviles y tendencias
+                recent_accuracy = np.mean([m.get('accuracy', 0) for m in recent_metrics if m.get('accuracy')])
+                baseline_size = min(len(performance_log) - window_size, window_size * 2)
+                baseline_metrics = performance_log[-baseline_size-window_size:-window_size] if baseline_size > 0 else performance_log[:-window_size]
+                baseline_accuracy = np.mean([m.get('accuracy', 0) for m in baseline_metrics if m.get('accuracy')]) if baseline_metrics else recent_accuracy
                 
-                recent_precision = np.mean([m.get('precision', 0) for m in recent_metrics])
-                baseline_precision = np.mean([m.get('precision', 0) for m in performance_log[:-5]])
+                recent_precision = np.mean([m.get('precision', 0) for m in recent_metrics if m.get('precision')])
+                baseline_precision = np.mean([m.get('precision', 0) for m in baseline_metrics if m.get('precision')]) if baseline_metrics else recent_precision
                 
-                # Detectar degradación (caída > 5%)
+                recent_recall = np.mean([m.get('recall', 0) for m in recent_metrics if m.get('recall')])
+                baseline_recall = np.mean([m.get('recall', 0) for m in baseline_metrics if m.get('recall')]) if baseline_metrics else recent_recall
+                
+                recent_f1 = np.mean([m.get('f1_score', 0) for m in recent_metrics if m.get('f1_score')])
+                baseline_f1 = np.mean([m.get('f1_score', 0) for m in baseline_metrics if m.get('f1_score')]) if baseline_metrics else recent_f1
+                
+                # Detectar degradación (caída porcentual)
                 accuracy_degradation = (baseline_accuracy - recent_accuracy) / baseline_accuracy if baseline_accuracy > 0 else 0
                 precision_degradation = (baseline_precision - recent_precision) / baseline_precision if baseline_precision > 0 else 0
+                recall_degradation = (baseline_recall - recent_recall) / baseline_recall if baseline_recall > 0 else 0
+                f1_degradation = (baseline_f1 - recent_f1) / baseline_f1 if baseline_f1 > 0 else 0
+                
+                # Determinar severidad basada en la peor degradación
+                max_degradation = max(accuracy_degradation, precision_degradation, recall_degradation, f1_degradation)
+                
+                if max_degradation >= degradation_threshold_high:
+                    degradation_severity = 'CRITICAL'
+                    performance_degradation = True
+                elif max_degradation >= degradation_threshold_medium:
+                    degradation_severity = 'HIGH'
+                    performance_degradation = True
+                elif max_degradation >= degradation_threshold_low:
+                    degradation_severity = 'MEDIUM'
+                    performance_degradation = True
+                
+                # Análisis de tendencia (regresión lineal)
+                if len(recent_metrics) >= 3:
+                    accuracy_values = [m.get('accuracy', 0) for m in recent_metrics if m.get('accuracy')]
+                    if len(accuracy_values) >= 3:
+                        x = np.arange(len(accuracy_values))
+                        slope = np.polyfit(x, accuracy_values, 1)[0] if len(accuracy_values) > 1 else 0
+                        trend = 'decreasing' if slope < -0.001 else 'increasing' if slope > 0.001 else 'stable'
+                    else:
+                        trend = 'unknown'
+                else:
+                    trend = 'insufficient_data'
                 
                 performance_metrics = {
-                    'baseline_accuracy': baseline_accuracy,
-                    'recent_accuracy': recent_accuracy,
-                    'accuracy_degradation': accuracy_degradation,
-                    'baseline_precision': baseline_precision,
-                    'recent_precision': recent_precision,
-                    'precision_degradation': precision_degradation
+                    'baseline_accuracy': float(baseline_accuracy),
+                    'recent_accuracy': float(recent_accuracy),
+                    'accuracy_degradation': float(accuracy_degradation),
+                    'baseline_precision': float(baseline_precision),
+                    'recent_precision': float(recent_precision),
+                    'precision_degradation': float(precision_degradation),
+                    'baseline_recall': float(baseline_recall),
+                    'recent_recall': float(recent_recall),
+                    'recall_degradation': float(recall_degradation),
+                    'baseline_f1': float(baseline_f1),
+                    'recent_f1': float(recent_f1),
+                    'f1_degradation': float(f1_degradation),
+                    'max_degradation': float(max_degradation),
+                    'trend': trend,
+                    'data_points': len(performance_log),
+                    'window_size': window_size
                 }
                 
-                if accuracy_degradation > 0.05 or precision_degradation > 0.05:
-                    performance_degradation = True
-                    logger.warning(f"Model performance degradation detected: accuracy {-accuracy_degradation:.1%}, precision {-precision_degradation:.1%}")
+                if performance_degradation:
+                    logger.warning(f"Model performance degradation detected: Max degradation {max_degradation:.1%}, Severity: {degradation_severity}, Trend: {trend}")
                 
         except Exception as e:
             logger.error(f"Error monitoring model performance: {str(e)}")
             # No fallar el pipeline por problemas de monitoreo
+    else:
+        logger.info("No performance log found. This may be the first run or performance logging is not enabled.")
+    
+    # Guardar métricas actuales del entrenamiento si están disponibles
+    training_results = context['task_instance'].xcom_pull(key='training_results', task_ids='train_model')
+    if training_results and os.path.exists(performance_log_path):
+        try:
+            with open(performance_log_path, 'r') as f:
+                performance_log = json.load(f)
+            
+            # Agregar métricas actuales
+            new_entry = {
+                'timestamp': datetime.now().isoformat(),
+                'accuracy': training_results.get('accuracy'),
+                'precision': training_results.get('precision'),
+                'recall': training_results.get('recall'),
+                'f1_score': training_results.get('f1_score'),
+                'model_version': get_config().get('model_version', '1.0.0'),
+                'dag_run_id': context['run_id']
+            }
+            performance_log.append(new_entry)
+            
+            # Mantener solo últimos 50 registros
+            performance_log = performance_log[-50:]
+            
+            with open(performance_log_path, 'w') as f:
+                json.dump(performance_log, f, indent=2)
+            
+            logger.info("Performance metrics logged successfully")
+        except Exception as e:
+            logger.error(f"Error logging performance metrics: {str(e)}")
+    elif training_results:
+        # Crear nuevo archivo de log
+        try:
+            os.makedirs(os.path.dirname(performance_log_path), exist_ok=True)
+            new_entry = {
+                'timestamp': datetime.now().isoformat(),
+                'accuracy': training_results.get('accuracy'),
+                'precision': training_results.get('precision'),
+                'recall': training_results.get('recall'),
+                'f1_score': training_results.get('f1_score'),
+                'model_version': get_config().get('model_version', '1.0.0'),
+                'dag_run_id': context['run_id']
+            }
+            with open(performance_log_path, 'w') as f:
+                json.dump([new_entry], f, indent=2)
+            logger.info("Created new performance log file")
+        except Exception as e:
+            logger.error(f"Error creating performance log: {str(e)}")
     
     # Guardar resultados
     context['task_instance'].xcom_push(key='performance_monitoring', value={
         'degradation_detected': performance_degradation,
+        'severity': degradation_severity,
         'metrics': performance_metrics,
         'timestamp': datetime.now().isoformat()
     })
     
-    logger.info("Model performance monitoring completed")
-    return "Performance monitoring completed"
+    logger.info(f"Model performance monitoring completed. Degradation: {performance_degradation}, Severity: {degradation_severity}")
+    return f"Performance monitoring completed - Severity: {degradation_severity}"
 
 
 def send_advanced_alerts(**context):
@@ -482,7 +665,7 @@ def send_advanced_alerts(**context):
     
     # Recopilar información de todas las tareas
     drift_detection = context['task_instance'].xcom_pull(key='drift_detection')
-    performance_monitoring = context['task_instance'].xcom_push(key='performance_monitoring')
+    performance_monitoring = context['task_instance'].xcom_pull(key='performance_monitoring')
     training_results = context['task_instance'].xcom_pull(key='training_results')
     validation_results = context['task_instance'].xcom_pull(key='validation_results')
     
@@ -490,34 +673,88 @@ def send_advanced_alerts(**context):
     
     # Alertas de deriva de datos
     if drift_detection and drift_detection.get('drift_detected', False):
+        drift_severity = drift_detection.get('severity', 'MEDIUM')
+        alert_severity = 'CRITICAL' if drift_severity == 'CRITICAL' else 'HIGH' if drift_severity == 'HIGH' else 'WARNING'
         alerts.append({
             'type': 'DATA_DRIFT',
-            'severity': 'WARNING',
-            'message': 'Significant data drift detected in training data',
-            'details': drift_detection.get('metrics', {})
+            'severity': alert_severity,
+            'message': f'Data drift detected in training data (Severity: {drift_severity})',
+            'details': {
+                'drift_severity': drift_severity,
+                'metrics': drift_detection.get('metrics', {}),
+                'timestamp': drift_detection.get('timestamp')
+            }
         })
     
     # Alertas de degradación de modelo
     if performance_monitoring and performance_monitoring.get('degradation_detected', False):
+        perf_severity = performance_monitoring.get('severity', 'MEDIUM')
+        alert_severity = 'CRITICAL' if perf_severity == 'CRITICAL' else 'HIGH' if perf_severity == 'HIGH' else 'WARNING'
+        metrics = performance_monitoring.get('metrics', {})
         alerts.append({
             'type': 'MODEL_DEGRADATION',
-            'severity': 'CRITICAL',
-            'message': 'Model performance degradation detected',
-            'details': performance_monitoring.get('metrics', {})
+            'severity': alert_severity,
+            'message': f'Model performance degradation detected (Severity: {perf_severity}, Max degradation: {metrics.get("max_degradation", 0):.1%})',
+            'details': {
+                'degradation_severity': perf_severity,
+                'metrics': metrics,
+                'timestamp': performance_monitoring.get('timestamp')
+            }
         })
     
     # Alertas de bajo rendimiento de entrenamiento
     if training_results and validation_results:
         accuracy = training_results.get('accuracy', 0)
-        min_accuracy = 0.8  # Umbral más alto para alerta
+        precision = training_results.get('precision', 0)
+        recall = training_results.get('recall', 0)
+        f1_score = training_results.get('f1_score', 0)
         
-        if accuracy < min_accuracy:
+        # Umbrales configurables
+        alert_accuracy_threshold = float(Variable.get('alert_accuracy_threshold', default_var='0.80'))
+        alert_precision_threshold = float(Variable.get('alert_precision_threshold', default_var='0.75'))
+        alert_recall_threshold = float(Variable.get('alert_recall_threshold', default_var='0.70'))
+        alert_f1_threshold = float(Variable.get('alert_f1_threshold', default_var='0.75'))
+        
+        if accuracy < alert_accuracy_threshold:
             alerts.append({
                 'type': 'LOW_ACCURACY',
                 'severity': 'WARNING',
-                'message': f'Model accuracy ({accuracy:.3f}) below alert threshold ({min_accuracy})',
-                'details': {'accuracy': accuracy, 'threshold': min_accuracy}
+                'message': f'Model accuracy ({accuracy:.3f}) below alert threshold ({alert_accuracy_threshold})',
+                'details': {'accuracy': accuracy, 'threshold': alert_accuracy_threshold}
             })
+        
+        if precision < alert_precision_threshold:
+            alerts.append({
+                'type': 'LOW_PRECISION',
+                'severity': 'WARNING',
+                'message': f'Model precision ({precision:.3f}) below alert threshold ({alert_precision_threshold})',
+                'details': {'precision': precision, 'threshold': alert_precision_threshold}
+            })
+        
+        if recall < alert_recall_threshold:
+            alerts.append({
+                'type': 'LOW_RECALL',
+                'severity': 'WARNING',
+                'message': f'Model recall ({recall:.3f}) below alert threshold ({alert_recall_threshold})',
+                'details': {'recall': recall, 'threshold': alert_recall_threshold}
+            })
+        
+        if f1_score < alert_f1_threshold:
+            alerts.append({
+                'type': 'LOW_F1_SCORE',
+                'severity': 'WARNING',
+                'message': f'Model F1-score ({f1_score:.3f}) below alert threshold ({alert_f1_threshold})',
+                'details': {'f1_score': f1_score, 'threshold': alert_f1_threshold}
+            })
+    
+    # Alertas de validación fallida
+    if validation_results and not validation_results.get('passed', False):
+        alerts.append({
+            'type': 'VALIDATION_FAILED',
+            'severity': 'CRITICAL',
+            'message': 'Model validation failed - metrics below minimum thresholds',
+            'details': validation_results.get('metrics', {})
+        })
     
     # Enviar alertas si hay alguna
     if alerts:
@@ -566,6 +803,9 @@ DAG Run ID: {context['run_id']}
     
     logger.info("Advanced alerts processing completed")
     return f"Sent {len(alerts)} alerts"
+
+
+def generate_report(**context):
     """
     Genera un reporte del entrenamiento.
     """
